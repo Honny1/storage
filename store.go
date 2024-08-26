@@ -86,9 +86,10 @@ type ApplyStagedLayerOptions struct {
 
 // MultiListOptions contains options to pass to MultiList
 type MultiListOptions struct {
-	Images     bool // if true, Images will be listed in the result
-	Layers     bool // if true, layers will be listed in the result
-	Containers bool // if true, containers will be listed in the result
+	Images     bool                                             // if true, Images will be listed in the result
+	Layers     bool                                             // if true, layers will be listed in the result
+	Containers bool                                             // if true, containers will be listed in the result
+	Callback   func(r MultiListResult) (MultiListResult, error) // this function is called after getting all required MultiListResult data with locked layers and images, its result is then returned as MultiList result
 }
 
 // MultiListResult contains slices of Images, Layers or Containers listed by MultiList method
@@ -3884,6 +3885,14 @@ func (s *store) MultiList(options MultiListOptions) (MultiListResult, error) {
 			return MultiListResult{}, err
 		}
 		out.Containers = append(out.Containers, containers...)
+	}
+
+	if options.Callback != nil {
+		out, err := options.Callback(out)
+		if err != nil {
+			return MultiListResult{}, err
+		}
+		return out, nil
 	}
 	return out, nil
 }
