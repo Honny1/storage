@@ -3967,3 +3967,291 @@ func (s *store) Dedup(req DedupArgs) (drivers.DedupResult, error) {
 		return rlstore.dedup(r)
 	})
 }
+
+func (s *store) MoveLayerToTrash(id string) (string, error) {
+	trashPath, err := os.MkdirTemp("", "trash")
+	if err != nil {
+		return "", err
+	}
+	err = s.writeToAllStores(func(rlstore rwLayerStore) error {
+		if rlstore.Exists(id) {
+			if l, err := rlstore.Get(id); err != nil {
+				id = l.ID
+			}
+			layers, err := rlstore.Layers()
+			if err != nil {
+				return err
+			}
+			for _, layer := range layers {
+				if layer.Parent == id {
+					return fmt.Errorf("used by layer %v: %w", layer.ID, ErrLayerHasChildren)
+				}
+			}
+			images, err := s.imageStore.Images()
+			if err != nil {
+				return err
+			}
+
+			for _, image := range images {
+				if image.TopLayer == id {
+					return fmt.Errorf("layer %v used by image %v: %w", id, image.ID, ErrLayerUsedByImage)
+				}
+			}
+			containers, err := s.containerStore.Containers()
+			if err != nil {
+				return err
+			}
+			for _, container := range containers {
+				if container.LayerID == id {
+					return fmt.Errorf("layer %v used by container %v: %w", id, container.ID, ErrLayerUsedByContainer)
+				}
+			}
+			if err := rlstore.MoveToTrash(id, trashPath); err != nil {
+				return fmt.Errorf("move to trash layer %v: %w", id, err)
+			}
+
+			for _, image := range images {
+				if stringutils.InSlice(image.MappedTopLayers, id) {
+					if err = s.imageStore.removeMappedTopLayer(image.ID, id); err != nil {
+						return fmt.Errorf("remove mapped top layer %v from image %v: %w", id, image.ID, err)
+					}
+				}
+			}
+			return nil
+		}
+		return ErrNotALayer
+	})
+	if err != nil {
+		return trashPath, err
+	}
+	return trashPath, nil
+}
+
+func (s *store) MoveImageToTrash(id string, commit bool) ([]string, string, error) {
+	trashPath, err := os.MkdirTemp("", "trash")
+	if err != nil {
+		return nil, "", err
+	}
+	layersToRemove := []string{}
+	err = s.writeToAllStores(func(rlstore rwLayerStore) error {
+		// Delete image from all available imagestores configured to be used.
+		imageFound := false
+		for _, is := range s.rwImageStores {
+			if is != s.imageStore {
+				// This is an additional writeable image store
+				// so we must perform lock
+				if err := is.startWriting(); err != nil {
+					return err
+				}
+				defer is.stopWriting()
+			}
+			if !is.Exists(id) {
+				continue
+			}
+			imageFound = true
+			image, err := is.Get(id)
+			if err != nil {
+				return err
+			}
+			id = image.ID
+			containers, err := s.containerStore.Containers()
+			if err != nil {
+				return err
+			}
+			aContainerByImage := make(map[string]string)
+			for _, container := range containers {
+				aContainerByImage[container.ImageID] = container.ID
+			}
+			if container, ok := aContainerByImage[id]; ok {
+				return fmt.Errorf("image used by %v: %w", container, ErrImageUsedByContainer)
+			}
+			images, err := is.Images()
+			if err != nil {
+				return err
+			}
+			layers, err := rlstore.Layers()
+			if err != nil {
+				return err
+			}
+			childrenByParent := make(map[string][]string)
+			for _, layer := range layers {
+				childrenByParent[layer.Parent] = append(childrenByParent[layer.Parent], layer.ID)
+			}
+			otherImagesTopLayers := make(map[string]struct{})
+			for _, img := range images {
+				if img.ID != id {
+					otherImagesTopLayers[img.TopLayer] = struct{}{}
+					for _, layerID := range img.MappedTopLayers {
+						otherImagesTopLayers[layerID] = struct{}{}
+					}
+				}
+			}
+			if commit {
+				if err = is.MoveToTrash(id, trashPath); err != nil {
+					return err
+				}
+			}
+			layer := image.TopLayer
+			layersToRemoveMap := make(map[string]struct{})
+			layersToRemove = append(layersToRemove, image.MappedTopLayers...)
+			for _, mappedTopLayer := range image.MappedTopLayers {
+				layersToRemoveMap[mappedTopLayer] = struct{}{}
+			}
+			for layer != "" {
+				if s.containerStore.Exists(layer) {
+					break
+				}
+				if _, used := otherImagesTopLayers[layer]; used {
+					break
+				}
+				parent := ""
+				if l, err := rlstore.Get(layer); err == nil {
+					parent = l.Parent
+				}
+				hasChildrenNotBeingRemoved := func() bool {
+					layersToCheck := []string{layer}
+					if layer == image.TopLayer {
+						layersToCheck = append(layersToCheck, image.MappedTopLayers...)
+					}
+					for _, layer := range layersToCheck {
+						if childList := childrenByParent[layer]; len(childList) > 0 {
+							for _, child := range childList {
+								if _, childIsSlatedForRemoval := layersToRemoveMap[child]; childIsSlatedForRemoval {
+									continue
+								}
+								return true
+							}
+						}
+					}
+					return false
+				}
+				if hasChildrenNotBeingRemoved() {
+					break
+				}
+				layersToRemove = append(layersToRemove, layer)
+				layersToRemoveMap[layer] = struct{}{}
+				layer = parent
+			}
+		}
+		if !imageFound {
+			return ErrNotAnImage
+		}
+		if commit {
+			for _, layer := range layersToRemove {
+				if err = rlstore.MoveToTrash(layer, trashPath); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, trashPath, err
+	}
+	return layersToRemove, trashPath, nil
+}
+
+func (s *store) MoveContainerToTrash(id string) (string, error) {
+	trashPath, err := os.MkdirTemp("", "trash")
+	if err != nil {
+		return "", err
+	}
+
+	err = s.writeToAllStores(func(rlstore rwLayerStore) error {
+		if !s.containerStore.Exists(id) {
+			return ErrNotAContainer
+		}
+
+		container, err := s.containerStore.Get(id)
+		if err != nil {
+			return ErrNotAContainer
+		}
+
+		// delete the layer first, separately, so that if we get an
+		// error while trying to do so, we don't go ahead and delete
+		// the container record that refers to it, effectively losing
+		// track of it
+		if rlstore.Exists(container.LayerID) {
+			if err := rlstore.MoveToTrash(container.LayerID, trashPath); err != nil {
+				return err
+			}
+		}
+
+		var wg errgroup.Group
+
+		middleDir := s.graphDriverName + "-containers"
+
+		wg.Go(func() error {
+			gcpath := filepath.Join(s.GraphRoot(), middleDir, container.ID)
+			return moveToTrash(gcpath, trashPath)
+		})
+
+		wg.Go(func() error {
+			rcpath := filepath.Join(s.RunRoot(), middleDir, container.ID)
+			return moveToTrash(rcpath, trashPath)
+		})
+
+		if multierr := wg.Wait(); multierr != nil {
+			return multierr
+		}
+		return s.containerStore.MoveToTrash(id, trashPath)
+	})
+	if err != nil {
+		return trashPath, err
+	}
+	return trashPath, nil
+}
+
+func (s *store) MoveToTrash(id string) (string, error) {
+	trashPath, err := os.MkdirTemp("", "trash")
+	if err != nil {
+		return "", err
+	}
+	err = s.writeToAllStores(func(rlstore rwLayerStore) error {
+		if s.containerStore.Exists(id) {
+			if container, err := s.containerStore.Get(id); err == nil {
+				if rlstore.Exists(container.LayerID) {
+					if err = rlstore.MoveToTrash(container.LayerID, trashPath); err != nil {
+						return err
+					}
+
+					if err = s.containerStore.MoveToTrash(id, trashPath); err != nil {
+						return err
+					}
+
+					var wg errgroup.Group
+
+					middleDir := s.graphDriverName + "-containers"
+
+					wg.Go(func() error {
+						gcpath := filepath.Join(s.GraphRoot(), middleDir, container.ID)
+						return moveToTrash(gcpath, trashPath)
+					})
+
+					wg.Go(func() error {
+						rcpath := filepath.Join(s.RunRoot(), middleDir, container.ID)
+						return moveToTrash(rcpath, trashPath)
+					})
+
+					if multierr := wg.Wait(); multierr != nil {
+						return multierr
+					}
+					return nil
+				}
+				return ErrNotALayer
+			}
+		}
+		if s.imageStore.Exists(id) {
+			return s.imageStore.MoveToTrash(id, trashPath)
+		}
+		if rlstore.Exists(id) {
+			return rlstore.MoveToTrash(id, trashPath)
+		}
+		return ErrLayerUnknown
+	})
+	if err != nil {
+		return trashPath, err
+	}
+	// defer func() { go os.RemoveAll(treshPath) }()
+	return trashPath, nil
+}

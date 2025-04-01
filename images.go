@@ -151,6 +151,8 @@ type rwImageStore interface {
 	// Delete removes the record of the image.
 	Delete(id string) error
 
+	MoveToTrash(id string, trashPath string) error
+
 	addMappedTopLayer(id, layer string) error
 	removeMappedTopLayer(id, layer string) error
 
@@ -1068,4 +1070,47 @@ func (r *imageStore) Wipe() error {
 		}
 	}
 	return nil
+}
+
+// Requires startWriting.
+func (r *imageStore) MoveToTrash(id, trashPath string) error {
+	if !r.lockfile.IsReadWrite() {
+		return fmt.Errorf("not allowed to delete images at %q: %w", r.imagespath(), ErrStoreIsReadOnly)
+	}
+	image, ok := r.lookup(id)
+	if !ok {
+		return ErrImageUnknown
+	}
+
+	if !containsIncompleteFlag(image.Flags) {
+		if err := r.SetFlag(id, incompleteFlag, true); err != nil {
+			return err
+		}
+	}
+
+	id = image.ID
+	delete(r.byid, id)
+	// This can only fail if the ID is already missing, which shouldn’t happen — and in that case the index is already in the desired state anyway.
+	// The store’s Delete method is used on various paths to recover from failures, so this should be robust against partially missing data.
+	_ = r.idindex.Delete(id)
+	for _, name := range image.Names {
+		delete(r.byname, name)
+	}
+	for _, digest := range image.Digests {
+		prunedList := slices.DeleteFunc(r.bydigest[digest], func(i *Image) bool {
+			return i == image
+		})
+		if len(prunedList) == 0 {
+			delete(r.bydigest, digest)
+		} else {
+			r.bydigest[digest] = prunedList
+		}
+	}
+	r.images = slices.DeleteFunc(r.images, func(candidate *Image) bool {
+		return candidate.ID == id
+	})
+	if err := moveToTrash(r.datadir(id), trashPath); err != nil {
+		return err
+	}
+	return r.Save()
 }

@@ -293,6 +293,8 @@ type rwLayerStore interface {
 	// Delete deletes a layer with the specified name or ID.
 	Delete(id string) error
 
+	MoveToTrash(id, trash string) error
+
 	// Wipe deletes all layers.
 	Wipe() error
 
@@ -2643,4 +2645,79 @@ func closeAll(closes ...func() error) (rErr error) {
 		}
 	}
 	return
+}
+
+// Requires startWriting.
+func (r *layerStore) moveToTrashInternal(id, trashPath string) error {
+	if !r.lockfile.IsReadWrite() {
+		return fmt.Errorf("not allowed to delete layers at %q: %w", r.layerdir, ErrStoreIsReadOnly)
+	}
+	layer, ok := r.lookup(id)
+	if !ok {
+		return ErrLayerUnknown
+	}
+	// Ensure that if we are interrupted, the layer will be cleaned up.
+	if !containsIncompleteFlag(layer.Flags) {
+		if err := r.SetFlag(id, incompleteFlag, true); err != nil {
+			return err
+		}
+	}
+	// TODO: USE move to trash for driver
+	// We never unset incompleteFlag; below, we remove the entire object from r.layers.
+	id = layer.ID
+	if err := r.driver.Remove(id); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
+	moveToTrash(r.tspath(id), trashPath)
+	moveToTrash(r.datadir(id), trashPath)
+	delete(r.byid, id)
+	for _, name := range layer.Names {
+		delete(r.byname, name)
+	}
+	// This can only fail if the ID is already missing, which shouldn’t
+	// happen — and in that case the index is already in the desired state
+	// anyway.  The store’s Delete method is used on various paths to
+	// recover from failures, so this should be robust against partially
+	// missing data.
+	_ = r.idindex.Delete(id)
+	mountLabel := layer.MountLabel
+	if layer.MountPoint != "" {
+		delete(r.bymount, layer.MountPoint)
+	}
+	r.deleteInDigestMap(id)
+	r.layers = slices.DeleteFunc(r.layers, func(candidate *Layer) bool {
+		return candidate.ID == id
+	})
+	if mountLabel != "" && !slices.ContainsFunc(r.layers, func(candidate *Layer) bool {
+		return candidate.MountLabel == mountLabel
+	}) {
+		selinux.ReleaseLabel(mountLabel)
+	}
+	return nil
+}
+
+// Requires startWriting.
+func (r *layerStore) MoveToTrash(id, trashPath string) error {
+	layer, ok := r.lookup(id)
+	if !ok {
+		return ErrLayerUnknown
+	}
+	id = layer.ID
+	// The layer may already have been explicitly unmounted, but if not, we
+	// should try to clean that up before we start deleting anything at the
+	// driver level.
+	for {
+		_, err := r.unmount(id, false, true)
+		if err == ErrLayerNotMounted {
+			break
+		}
+		if err != nil {
+			return err
+		}
+	}
+	if err := r.moveToTrashInternal(id, trashPath); err != nil {
+		return err
+	}
+	return r.saveFor(layer)
 }

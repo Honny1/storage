@@ -2,6 +2,8 @@ package storage
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
 
 	"github.com/containers/storage/types"
@@ -52,4 +54,28 @@ func applyNameOperation(oldNames []string, opParameters []string, op updateNameO
 		return result, errInvalidUpdateNameOperation
 	}
 	return dedupeStrings(result), nil
+}
+
+func moveToTrash(source, trashPath string) error {
+	trashPath, err := os.MkdirTemp(trashPath, "")
+	if err != nil {
+		return fmt.Errorf("creating temp dir in %q: %w", trashPath, err)
+	}
+	if err := os.Rename(source, filepath.Join(trashPath, filepath.Base(source))); err != nil {
+		return fmt.Errorf("moving %q to %q: %w", source, trashPath, err)
+	}
+	return nil
+}
+
+// containsIncompleteFlag returns true if map contains an incompleteFlag set to true
+func containsIncompleteFlag(f map[string]interface{}) bool {
+	if f == nil {
+		return false
+	}
+	if flagValue, ok := f[incompleteFlag]; ok {
+		if b, ok := flagValue.(bool); ok && b {
+			return true
+		}
+	}
+	return false
 }

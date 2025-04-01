@@ -128,6 +128,8 @@ type rwContainerStore interface {
 	// Delete removes the record of the container.
 	Delete(id string) error
 
+	MoveToTrash(id string, trashPath string) error
+
 	// Wipe removes records of all containers.
 	Wipe() error
 
@@ -960,4 +962,35 @@ func (r *containerStore) Wipe() error {
 		}
 	}
 	return nil
+}
+
+// Requires startWriting.
+func (r *containerStore) MoveToTrash(id, trashPath string) error {
+	container, ok := r.lookup(id)
+	if !ok {
+		return ErrContainerUnknown
+	}
+
+	if !containsIncompleteFlag(container.Flags) {
+		if err := r.SetFlag(container.ID, incompleteFlag, true); err != nil {
+			return err
+		}
+	}
+
+	id = container.ID
+	delete(r.byid, id)
+	// This can only fail if the ID is already missing, which shouldn’t happen — and in that case the index is already in the desired state anyway.
+	// The store’s Delete method is used on various paths to recover from failures, so this should be robust against partially missing data.
+	_ = r.idindex.Delete(id)
+	delete(r.bylayer, container.LayerID)
+	for _, name := range container.Names {
+		delete(r.byname, name)
+	}
+	r.containers = slices.DeleteFunc(r.containers, func(candidate *Container) bool {
+		return candidate.ID == id
+	})
+	if err := moveToTrash(r.datadir(id), trashPath); err != nil {
+		return err
+	}
+	return r.saveFor(container)
 }
